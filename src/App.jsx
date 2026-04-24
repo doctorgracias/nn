@@ -4,6 +4,7 @@ import { rungeKutta4 } from './models/runge-kutta';
 import { systemODE } from './models/dynamic-system';
 import { Sequential } from './service/nn/Sequential';
 import { DenseLayer } from './service/nn/DenseLayer';
+import 'index.css'
 
 function computeStats(data) {
     const n = data.length;
@@ -37,7 +38,7 @@ function denormalize(normCoords, means, stds) {
 
 function createModel() {
     return new Sequential([
-        new DenseLayer(64, 'tanh'),   // tanh, не sigmoid
+        new DenseLayer(64, 'tanh'), 
         new DenseLayer(64, 'tanh'),
         new DenseLayer(3,  'linear')
     ]);
@@ -49,7 +50,7 @@ export default function App() {
     const [isTraining,    setIsTraining]    = useState(false);
     const [loss,          setLoss]          = useState(null);
     const [epochs,        setEpochs]        = useState(200);
-    const [status,        setStatus]        = useState('Готов');
+    const [status,        setStatus]        = useState('ready');
 
     // useRef вместо useMemo — чтобы пересоздавать модель перед каждым обучением
     const modelRef = useRef(createModel());
@@ -61,7 +62,7 @@ export default function App() {
         setSolution(result);
         setPredictedPath([]);
         setLoss(null);
-        setStatus('Готов');
+        setStatus('ready');
     };
 
     useEffect(() => { runSimulation(); }, []);
@@ -78,13 +79,7 @@ export default function App() {
         const { means, stds } = computeStats(solution);
         const trainSize    = Math.floor(solution.length * 0.8);
         const learningRate = 0.001;
-
-        // Строим пары в нормализованном пространстве
-        // input:  normCurrent  (позиция)
-        // target: normNext     (следующая позиция, не дельта!)
-        //
-        // Ключевое изменение: учим предсказывать normNext напрямую,
-        // а не дельту — это стабильнее при авторегрессии
+        
         const trainPairs = [];
         for (let i = 0; i < trainSize - 1; i++) {
             const normCurrent = normalize(
@@ -111,14 +106,14 @@ export default function App() {
             if (e % 10 === 0) {
                 const mse = totalError / trainPairs.length;
                 setLoss(mse);
-                setStatus(`Эпоха ${e + 1}/${epochs}`);
+                setStatus(`epoch ${e + 1}/${epochs}`);
                 await new Promise(r => setTimeout(r, 1));
             }
         }
 
         generatePrediction(means, stds);
         setIsTraining(false);
-        setStatus('Готово ✓');
+        setStatus('ready');
     };
 
     const generatePrediction = (means, stds) => {
@@ -162,9 +157,9 @@ export default function App() {
                     onClick={runSimulation}
                     style={{ padding: '10px 20px', cursor: 'pointer', background: '#007bff', color: 'white', border: 'none', borderRadius: '4px' }}
                 >
-                    Пересчитать RK4
+                    resolve rk4
                 </button>
-                <span>Шагов: <strong>{params.steps}</strong></span>
+                <span>STEPS: <strong>{params.steps}</strong></span>
             </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 350px', gap: '20px' }}>
@@ -173,16 +168,15 @@ export default function App() {
                 </div>
 
                 <div style={{ background: '#f8f9fa', padding: '20px', borderRadius: '8px', border: '1px solid #dee2e6' }}>
-                    <h3 style={{ marginTop: 0 }}>Параметры обучения</h3>
+                    <h3 style={{ marginTop: 0 }}></h3>
                     <div style={{ fontSize: '14px', color: '#666' }}>
-                        <p>Модель: MLP (3 → 64 tanh → 64 tanh → 3)</p>
-                        <p>Статус: {isTraining ? `🚀 ${status}` : status}</p>
+                        <p>status: {isTraining ? ` ${status}` : status}</p>
                         {loss !== null && <p>MSE: <strong>{loss.toFixed(8)}</strong></p>}
                     </div>
 
                     <div style={{ marginTop: '10px', fontSize: '13px' }}>
                         <label>
-                            Эпох: <strong>{epochs}</strong>
+                            Epochs: <strong>{epochs}</strong>
                             <br />
                             <input
                                 type="range" min={50} max={500} step={50}
@@ -204,7 +198,7 @@ export default function App() {
                             cursor: isTraining ? 'not-allowed' : 'pointer'
                         }}
                     >
-                        {isTraining ? status : 'Обучить нейросеть'}
+                        {isTraining ? status : 'Start'}
                     </button>
                 </div>
             </div>

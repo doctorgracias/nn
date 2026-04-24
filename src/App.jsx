@@ -1,0 +1,213 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Scene } from './components/Scene';
+import { rungeKutta4 } from './models/runge-kutta';
+import { systemODE } from './models/dynamic-system';
+import { Sequential } from './service/nn/Sequential';
+import { DenseLayer } from './service/nn/DenseLayer';
+
+function computeStats(data) {
+    const n = data.length;
+    const means = [0, 0, 0];
+    const stds  = [0, 0, 0];
+
+    for (const row of data) {
+        means[0] += row[1]; means[1] += row[2]; means[2] += row[3];
+    }
+    means[0] /= n; means[1] /= n; means[2] /= n;
+
+    for (const row of data) {
+        stds[0] += (row[1] - means[0]) ** 2;
+        stds[1] += (row[2] - means[1]) ** 2;
+        stds[2] += (row[3] - means[2]) ** 2;
+    }
+    stds[0] = Math.sqrt(stds[0] / n) || 1;
+    stds[1] = Math.sqrt(stds[1] / n) || 1;
+    stds[2] = Math.sqrt(stds[2] / n) || 1;
+
+    return { means, stds };
+}
+
+function normalize(coords, means, stds) {
+    return coords.map((v, i) => (v - means[i]) / stds[i]);
+}
+
+function denormalize(normCoords, means, stds) {
+    return normCoords.map((v, i) => v * stds[i] + means[i]);
+}
+
+function createModel() {
+    return new Sequential([
+        new DenseLayer(64, 'tanh'),   // tanh, не sigmoid
+        new DenseLayer(64, 'tanh'),
+        new DenseLayer(3,  'linear')
+    ]);
+}
+
+export default function App() {
+    const [solution,      setSolution]      = useState([]);
+    const [predictedPath, setPredictedPath] = useState([]);
+    const [isTraining,    setIsTraining]    = useState(false);
+    const [loss,          setLoss]          = useState(null);
+    const [epochs,        setEpochs]        = useState(200);
+    const [status,        setStatus]        = useState('Готов');
+
+    // useRef вместо useMemo — чтобы пересоздавать модель перед каждым обучением
+    const modelRef = useRef(createModel());
+
+    const params = { h: 0.01, steps: 3000 };
+
+    const runSimulation = () => {
+        const result = rungeKutta4(systemODE, 0, [0.1, 0.1, 0.1], params.h, params.steps);
+        setSolution(result);
+        setPredictedPath([]);
+        setLoss(null);
+        setStatus('Готов');
+    };
+
+    useEffect(() => { runSimulation(); }, []);
+
+    const trainModel = async () => {
+        if (solution.length < 2) return;
+
+        // Пересоздаём модель — чистые веса при каждом запуске
+        modelRef.current = createModel();
+
+        setIsTraining(true);
+        setPredictedPath([]);
+
+        const { means, stds } = computeStats(solution);
+        const trainSize    = Math.floor(solution.length * 0.8);
+        const learningRate = 0.001;
+
+        // Строим пары в нормализованном пространстве
+        // input:  normCurrent  (позиция)
+        // target: normNext     (следующая позиция, не дельта!)
+        //
+        // Ключевое изменение: учим предсказывать normNext напрямую,
+        // а не дельту — это стабильнее при авторегрессии
+        const trainPairs = [];
+        for (let i = 0; i < trainSize - 1; i++) {
+            const normCurrent = normalize(
+                [solution[i][1],     solution[i][2],     solution[i][3]],
+                means, stds
+            );
+            const normNext = normalize(
+                [solution[i+1][1], solution[i+1][2], solution[i+1][3]],
+                means, stds
+            );
+            trainPairs.push({ input: [normCurrent], target: [normNext] });
+        }
+
+        const model = modelRef.current;
+
+        for (let e = 0; e < epochs; e++) {
+            let totalError = 0;
+            const shuffled = [...trainPairs].sort(() => Math.random() - 0.5);
+
+            for (const { input, target } of shuffled) {
+                totalError += model.trainStep(input, target, learningRate);
+            }
+
+            if (e % 10 === 0) {
+                const mse = totalError / trainPairs.length;
+                setLoss(mse);
+                setStatus(`Эпоха ${e + 1}/${epochs}`);
+                await new Promise(r => setTimeout(r, 1));
+            }
+        }
+
+        generatePrediction(means, stds);
+        setIsTraining(false);
+        setStatus('Готово ✓');
+    };
+
+    const generatePrediction = (means, stds) => {
+        const model = modelRef.current;
+
+        // Весь авторегрессивный цикл — в нормализованном пространстве.
+        // Денормализуем только для записи в path (рендер).
+        let normCoords = normalize([0.1, 0.1, 0.1], means, stds);
+        const path = [[0, 0.1, 0.1, 0.1]];
+
+        for (let i = 0; i < params.steps; i++) {
+            // Сеть: normCurrent → normNext
+            const normNext = model.predict([normCoords])[0];
+
+            if (normNext.some(v => !isFinite(v))) {
+                console.warn('Prediction diverged at step', i);
+                break;
+            }
+
+            // Порог проверяем тоже в норм. пространстве (±10σ разумный потолок)
+            if (normNext.some(v => Math.abs(v) > 10)) {
+                console.warn('Prediction exploded at step', i);
+                break;
+            }
+
+            const rawNext = denormalize(normNext, means, stds);
+            path.push([i + 1, ...rawNext]);
+
+            normCoords = normNext; // следующий шаг — в норм. пространстве
+        }
+
+        console.log(`Prediction: ${path.length} points`);
+        setPredictedPath(path);
+    };
+
+    // ... JSX остаётся прежним, только обнови текст описания модели:
+    return (
+        <div style={{ padding: '20px', fontFamily: 'sans-serif', color: '#333' }}>
+            <div style={{ marginBottom: '20px', display: 'flex', gap: '10px', alignItems: 'center' }}>
+                <button
+                    onClick={runSimulation}
+                    style={{ padding: '10px 20px', cursor: 'pointer', background: '#007bff', color: 'white', border: 'none', borderRadius: '4px' }}
+                >
+                    Пересчитать RK4
+                </button>
+                <span>Шагов: <strong>{params.steps}</strong></span>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 350px', gap: '20px' }}>
+                <div style={{ border: '1px solid #ccc', borderRadius: '8px', overflow: 'hidden' }}>
+                    <Scene solution={solution} prediction={predictedPath} />
+                </div>
+
+                <div style={{ background: '#f8f9fa', padding: '20px', borderRadius: '8px', border: '1px solid #dee2e6' }}>
+                    <h3 style={{ marginTop: 0 }}>Параметры обучения</h3>
+                    <div style={{ fontSize: '14px', color: '#666' }}>
+                        <p>Модель: MLP (3 → 64 tanh → 64 tanh → 3)</p>
+                        <p>Статус: {isTraining ? `🚀 ${status}` : status}</p>
+                        {loss !== null && <p>MSE: <strong>{loss.toFixed(8)}</strong></p>}
+                    </div>
+
+                    <div style={{ marginTop: '10px', fontSize: '13px' }}>
+                        <label>
+                            Эпох: <strong>{epochs}</strong>
+                            <br />
+                            <input
+                                type="range" min={50} max={500} step={50}
+                                value={epochs}
+                                onChange={e => setEpochs(Number(e.target.value))}
+                                style={{ width: '100%', marginTop: '4px' }}
+                                disabled={isTraining}
+                            />
+                        </label>
+                    </div>
+
+                    <button
+                        onClick={trainModel}
+                        disabled={isTraining || solution.length === 0}
+                        style={{
+                            width: '100%', padding: '12px', marginTop: '10px',
+                            background: isTraining ? '#ccc' : '#28a745',
+                            color: 'white', border: 'none', borderRadius: '4px',
+                            cursor: isTraining ? 'not-allowed' : 'pointer'
+                        }}
+                    >
+                        {isTraining ? status : 'Обучить нейросеть'}
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+}

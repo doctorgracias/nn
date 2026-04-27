@@ -148,8 +148,6 @@ export default function App() {
         console.log(`Prediction: ${path.length} points`);
         setPredictedPath(path);
     };
-
-    // ... JSX остаётся прежним, только обнови текст описания модели:
     return (
         <div style={{ padding: '20px', fontFamily: 'sans-serif', color: '#333' }}>
             <div style={{ marginBottom: '20px', display: 'flex', gap: '10px', alignItems: 'center' }}>

@@ -52,7 +52,6 @@ export default function App() {
     const [epochs,        setEpochs]        = useState(200);
     const [status,        setStatus]        = useState('ready');
 
-    // useRef вместо useMemo — чтобы пересоздавать модель перед каждым обучением
     const modelRef = useRef(createModel());
 
     const params = { h: 0.01, steps: 3000 };
@@ -70,7 +69,6 @@ export default function App() {
     const trainModel = async () => {
         if (solution.length < 2) return;
 
-        // Пересоздаём модель — чистые веса при каждом запуске
         modelRef.current = createModel();
 
         setIsTraining(true);
@@ -119,13 +117,10 @@ export default function App() {
     const generatePrediction = (means, stds) => {
         const model = modelRef.current;
 
-        // Весь авторегрессивный цикл — в нормализованном пространстве.
-        // Денормализуем только для записи в path (рендер).
         let normCoords = normalize([0.1, 0.1, 0.1], means, stds);
         const path = [[0, 0.1, 0.1, 0.1]];
 
         for (let i = 0; i < params.steps; i++) {
-            // Сеть: normCurrent → normNext
             const normNext = model.predict([normCoords])[0];
 
             if (normNext.some(v => !isFinite(v))) {
@@ -133,7 +128,6 @@ export default function App() {
                 break;
             }
 
-            // Порог проверяем тоже в норм. пространстве (±10σ разумный потолок)
             if (normNext.some(v => Math.abs(v) > 10)) {
                 console.warn('Prediction exploded at step', i);
                 break;
@@ -142,7 +136,7 @@ export default function App() {
             const rawNext = denormalize(normNext, means, stds);
             path.push([i + 1, ...rawNext]);
 
-            normCoords = normNext; // следующий шаг — в норм. пространстве
+            normCoords = normNext; 
         }
 
         console.log(`Prediction: ${path.length} points`);

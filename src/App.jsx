@@ -4,18 +4,17 @@ import { rungeKutta4 } from './models/runge-kutta';
 import { systemODE } from './models/dynamic-system';
 import { Sequential } from './service/nn/Sequential';
 import { DenseLayer } from './service/nn/DenseLayer';
-import 'index.css'
+
+// ─── Статистика и нормализация ────────────────────────────────────────────────
 
 function computeStats(data) {
     const n = data.length;
     const means = [0, 0, 0];
     const stds  = [0, 0, 0];
-
     for (const row of data) {
         means[0] += row[1]; means[1] += row[2]; means[2] += row[3];
     }
     means[0] /= n; means[1] /= n; means[2] /= n;
-
     for (const row of data) {
         stds[0] += (row[1] - means[0]) ** 2;
         stds[1] += (row[2] - means[1]) ** 2;
@@ -24,7 +23,6 @@ function computeStats(data) {
     stds[0] = Math.sqrt(stds[0] / n) || 1;
     stds[1] = Math.sqrt(stds[1] / n) || 1;
     stds[2] = Math.sqrt(stds[2] / n) || 1;
-
     return { means, stds };
 }
 
@@ -36,23 +34,40 @@ function denormalize(normCoords, means, stds) {
     return normCoords.map((v, i) => v * stds[i] + means[i]);
 }
 
+// ─── Модель ───────────────────────────────────────────────────────────────────
+
 function createModel() {
     return new Sequential([
-        new DenseLayer(64, 'tanh'), 
+        new DenseLayer(64, 'tanh'),
         new DenseLayer(64, 'tanh'),
         new DenseLayer(3,  'linear')
     ]);
 }
 
+// ─── Нормализация производных ─────────────────────────────────────────────────
+// Производная dx/dt имеет свой масштаб — нормируем отдельно через stds/h,
+// чтобы target был порядка O(1), а не O(0.001).
+function normalizeDeriv(deriv, stds, h) {
+    // deriv = [dx, dy, dz] в исходном пространстве
+    // нормируем так, чтобы величины были сопоставимы с нормализованными координатами
+    return deriv.map((v, i) => v * h / stds[i]);
+}
+
+function denormalizeDeriv(normDeriv, stds, h) {
+    return normDeriv.map((v, i) => v * stds[i] / h);
+}
+
 export default function App() {
+    const [showReference, setShowReference] = useState(true);
     const [solution,      setSolution]      = useState([]);
     const [predictedPath, setPredictedPath] = useState([]);
     const [isTraining,    setIsTraining]    = useState(false);
     const [loss,          setLoss]          = useState(null);
-    const [epochs,        setEpochs]        = useState(200);
+    const [epochs,        setEpochs]        = useState(300);
     const [status,        setStatus]        = useState('ready');
 
-    const modelRef = useRef(createModel());
+    const modelRef   = useRef(createModel());
+    const statsRef   = useRef(null);
 
     const params = { h: 0.01, steps: 3000 };
 
@@ -70,25 +85,26 @@ export default function App() {
         if (solution.length < 2) return;
 
         modelRef.current = createModel();
-
         setIsTraining(true);
         setPredictedPath([]);
 
         const { means, stds } = computeStats(solution);
+        statsRef.current = { means, stds };
+
         const trainSize    = Math.floor(solution.length * 0.8);
         const learningRate = 0.001;
-        
+        const BATCH_SIZE   = 64;
+
+        // ── Формируем обучающие пары: input=[x,y,z] → target=[dx/dt, dy/dt, dz/dt] ──
+        // Производные берём аналитически из systemODE — это эталон.
+        // Нормализуем вход (координаты) и выход (производные).
         const trainPairs = [];
-        for (let i = 0; i < trainSize - 1; i++) {
-            const normCurrent = normalize(
-                [solution[i][1],     solution[i][2],     solution[i][3]],
-                means, stds
-            );
-            const normNext = normalize(
-                [solution[i+1][1], solution[i+1][2], solution[i+1][3]],
-                means, stds
-            );
-            trainPairs.push({ input: [normCurrent], target: [normNext] });
+        for (let i = 0; i < trainSize; i++) {
+            const [t, x, y, z] = solution[i];
+            const normInput  = normalize([x, y, z], means, stds);
+            const rawDeriv   = systemODE(t, [x, y, z]);              // [dx, dy, dz]
+            const normTarget = normalizeDeriv(rawDeriv, stds, params.h);
+            trainPairs.push({ input: [normInput], target: [normTarget] });
         }
 
         const model = modelRef.current;
@@ -97,13 +113,16 @@ export default function App() {
             let totalError = 0;
             const shuffled = [...trainPairs].sort(() => Math.random() - 0.5);
 
-            for (const { input, target } of shuffled) {
-                totalError += model.trainStep(input, target, learningRate);
+            // Mini-batch
+            for (let b = 0; b < shuffled.length; b += BATCH_SIZE) {
+                const batch = shuffled.slice(b, b + BATCH_SIZE);
+                for (const { input, target } of batch) {
+                    totalError += model.trainStep(input, target, learningRate);
+                }
             }
 
             if (e % 10 === 0) {
-                const mse = totalError / trainPairs.length;
-                setLoss(mse);
+                setLoss(totalError / trainPairs.length);
                 setStatus(`epoch ${e + 1}/${epochs}`);
                 await new Promise(r => setTimeout(r, 1));
             }
@@ -116,32 +135,23 @@ export default function App() {
 
     const generatePrediction = (means, stds) => {
         const model = modelRef.current;
+        const h     = params.h;
 
-        let normCoords = normalize([0.1, 0.1, 0.1], means, stds);
-        const path = [[0, 0.1, 0.1, 0.1]];
+        // ── Neural ODE: используем RK4, но правые части считает нейросеть ──
+        // f_nn(t, [x, y, z]) → [dx/dt, dy/dt, dz/dt]
+        const f_nn = (t, state) => {
+            const normInput  = normalize(state, means, stds);
+            const normDeriv  = model.predict([normInput])[0];          // нормализованные производные
+            return denormalizeDeriv(normDeriv, stds, h);               // возвращаем в исходный масштаб
+        };
 
-        for (let i = 0; i < params.steps; i++) {
-            const normNext = model.predict([normCoords])[0];
+        // Используем существующий rungeKutta4, подменив функцию правых частей
+        const path = rungeKutta4(f_nn, 0, [0.1, 0.1, 0.1], h, params.steps);
 
-            if (normNext.some(v => !isFinite(v))) {
-                console.warn('Prediction diverged at step', i);
-                break;
-            }
-
-            if (normNext.some(v => Math.abs(v) > 10)) {
-                console.warn('Prediction exploded at step', i);
-                break;
-            }
-
-            const rawNext = denormalize(normNext, means, stds);
-            path.push([i + 1, ...rawNext]);
-
-            normCoords = normNext; 
-        }
-
-        console.log(`Prediction: ${path.length} points`);
+        console.log(`Neural ODE prediction: ${path.length} points`);
         setPredictedPath(path);
     };
+
     return (
         <div style={{ padding: '20px', fontFamily: 'sans-serif', color: '#333' }}>
             <div style={{ marginBottom: '20px', display: 'flex', gap: '10px', alignItems: 'center' }}>
@@ -151,18 +161,31 @@ export default function App() {
                 >
                     resolve rk4
                 </button>
+                <button
+                    onClick={() => setShowReference(p => !p)}
+                    style={{
+                        padding: '10px 20px', cursor: 'pointer',
+                        background: showReference ? '#6c757d' : '#17a2b8',
+                        color: 'white', border: 'none', borderRadius: '4px'
+                    }}
+                >
+                    {showReference ? 'hide reference' : 'show reference'}
+                </button>
                 <span>STEPS: <strong>{params.steps}</strong></span>
             </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 350px', gap: '20px' }}>
                 <div style={{ border: '1px solid #ccc', borderRadius: '8px', overflow: 'hidden' }}>
-                    <Scene solution={solution} prediction={predictedPath} />
+                    <Scene
+                        solution={showReference ? solution : []}
+                        prediction={predictedPath}
+                    />
                 </div>
 
                 <div style={{ background: '#f8f9fa', padding: '20px', borderRadius: '8px', border: '1px solid #dee2e6' }}>
-                    <h3 style={{ marginTop: 0 }}></h3>
                     <div style={{ fontSize: '14px', color: '#666' }}>
-                        <p>status: {isTraining ? ` ${status}` : status}</p>
+                        <p>mode: <strong>Neural ODE (RK4 + NN derivatives)</strong></p>
+                        <p>status: {status}</p>
                         {loss !== null && <p>MSE: <strong>{loss.toFixed(8)}</strong></p>}
                     </div>
 
